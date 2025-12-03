@@ -129,7 +129,14 @@ function Get-NetWkstaUserSessions {
                     $bufptr = [IntPtr]::Zero
                 }
             } elseif ($result -ne $ERROR_SUCCESS -and $result -ne $ERROR_MORE_DATA) {
-                Write-Warning "NetWkstaUserEnum failed with error code: $result"
+                # Get human-readable error message
+                $errorMsg = try {
+                    $exception = New-Object System.ComponentModel.Win32Exception($result)
+                    $exception.Message
+                } catch {
+                    "Error code: $result"
+                }
+                Write-Warning "NetWkstaUserEnum failed: $errorMsg"
                 Write-Warning "Common error codes: 5=Access Denied, 53=Network path not found, 87=Invalid parameter"
                 break
             }
