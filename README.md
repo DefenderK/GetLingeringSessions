@@ -1,4 +1,4 @@
-# Find-LingeringSessions.ps1
+# Get-LingeringSessions.ps1
 
 A PowerShell script that uses the Windows `NetWkstaUserEnum` API to detect lingering user sessions on Windows servers and workstations. The script compares sessions found via `NetWkstaUserEnum` with active logon sessions, running processes, and SMB sessions to identify stale or lingering sessions that may need cleanup.
 
@@ -24,13 +24,13 @@ A PowerShell script that uses the Windows `NetWkstaUserEnum` API to detect linge
 ### Basic Usage
 
 ```powershell
-.\Find-LingeringSessions.ps1 -TargetUser "DOMAIN\Username"
+.\Get-LingeringSessions.ps1 -TargetUser "DOMAIN\Username"
 ```
 
 ### Query Remote Server
 
 ```powershell
-.\Find-LingeringSessions.ps1 -TargetServer "SERVER01" -TargetUser "DOMAIN\Username"
+.\Get-LingeringSessions.ps1 -TargetServer "SERVER01" -TargetUser "DOMAIN\Username"
 ```
 
 ### Parameters
