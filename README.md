@@ -23,9 +23,17 @@ A PowerShell script that uses the Windows `NetWkstaUserEnum` API to detect linge
 
 ### Basic Usage
 
-```powershell
-.\Get-LingeringSessions.ps1 -TargetUser "DOMAIN\Username"
-```
+1. Download the script to your target system (or git clone)
+2. Open PowerShell as Administrator
+3. Navigate to the script directory
+4. Unblock the file (required for downloaded scripts):
+   ```powershell
+   Unblock-File -Path ".\Get-LingeringSessions.ps1"
+   ```
+5. Run the script:
+   ```powershell
+   .\Get-LingeringSessions.ps1 -TargetUser "DOMAIN\Username"
+   ```
 
 ### Query Remote Server
 
