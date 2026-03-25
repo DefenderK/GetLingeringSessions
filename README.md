@@ -10,7 +10,9 @@ A PowerShell script that uses the Windows `NetWkstaUserEnum` API to detect linge
   - Win32_LogonSession (WMI)
   - Active Processes
   - SMB Sessions
-- **Lingering Session Detection**: Automatically identifies sessions that appear in `NetWkstaUserEnum` but have no active logon sessions or running processes
+- **Lingering Session Detection**: User-level check: if the target user appears in `NetWkstaUserEnum` but has no matching WMI logon sessions and no running processes, the script flags a lingering state
+- **Remote-aware**: When `-TargetServer` is not the local computer, Sections 2–4 use WinRM/CIM (`Invoke-Command` for processes); Section 1 still uses `NetWkstaUserEnum` to the named server
+- **Flexible identity matching**: Treats `DOMAIN\User`, `user@domain`, exact string, SAM-only, and `*\Sam` style SMB/process names as matches where appropriate
 - **Detailed Reporting**: Clear section-by-section breakdown with explanations
 
 ## Requirements
@@ -41,10 +43,14 @@ A PowerShell script that uses the Windows `NetWkstaUserEnum` API to detect linge
 .\Get-LingeringSessions.ps1 -TargetServer "SERVER01" -TargetUser "DOMAIN\Username"
 ```
 
+For remote targets, **Section 1** (`NetWkstaUserEnum`) uses the Windows NetAPI against `SERVER01`. **Sections 2–4** query that same host via **WinRM** (WMI/CIM and `Invoke-Command`). Ensure the WinRM client firewall rule is enabled on your machine, that the target allows remote WMI/CIM and PowerShell remoting where needed, and that you run with a principal that has rights comparable to your BloodHound collector (often a domain admin or delegated collection account). **SMB sessions** (Section 4) use a CIM session to the target; if that fails, Section 4 may be empty while other sections still succeed.
+
+If you cannot use WinRM to the server, run the script **on the server** (local session or scheduled task) with `-TargetServer` omitted or set to the local computer name; Section 1 alone can still confirm whether `NetWkstaUserEnum` reports the user.
+
 ### Parameters
 
-- **`-TargetUser`** (Required): The user account to search for in `DOMAIN\Username` format
-- **`-TargetServer`** (Optional): The server or workstation to query. Defaults to local computer (`$env:COMPUTERNAME`)
+- **`-TargetUser`** (Required): User to match — typically `DOMAIN\Username`; `user@domain.com` is also accepted
+- **`-TargetServer`** (Optional): The server or workstation to query. Defaults to local computer (`$env:COMPUTERNAME`). Use `.` or `localhost` for local
 
 ## Example Output
 
@@ -54,6 +60,7 @@ LINGERING SESSION DETECTION REPORT
 ================================================================================
 Target Server: DC01-SERVER-22
 Target User: TESTDOMAIN\Administrator
+Query mode: Local
 
 ================================================================================
 SECTION 1: NetWkstaUserEnum - ALL SESSIONS
@@ -121,20 +128,16 @@ No SMB sessions found for 'TESTDOMAIN\Administrator'
 ================================================================================
 SECTION 5: LINGERING SESSION ANALYSIS
 ================================================================================
-WHAT THIS SHOWS: Sessions that appear in NetWkstaUserEnum but are NOT
-                 found in active logon sessions or processes.
-                 These are LINGERING sessions that may need cleanup.
+(User-level summary and NetWkstaUserEnum rows for the target user.)
 
-ACTIVE SESSION DETECTED:
-  User: TESTDOMAIN\Administrator
-  Logon Server: DC01-SERVER-22
-  Has Active Logon Session: True
-  Has Running Processes: True (28 processes)
-  Has SMB Session: False
-  Status: ACTIVE (Not lingering)
+ACTIVE USER STATE (not lingering by this heuristic):
+  NetWkstaUserEnum row count for user: 1
+  Has WMI logon session: True (1 session(s))
+  Has running processes: True (28 process(es))
+  Has SMB session (informational): False
 
-No lingering sessions detected.
-All sessions found in NetWkstaUserEnum have corresponding active logons or processes.
+NetWkstaUserEnum detail:
+(table of matching rows)
 
 ================================================================================
 SUMMARY
@@ -144,8 +147,8 @@ Active Logon Sessions: 1
 Running Processes: 28
 SMB Sessions: 0
 
-Note: NetWkstaUserEnum may show sessions that don't appear in other methods.
-      These are the 'lingering' sessions that Section 5 identifies.
+Note: NetWkstaUserEnum may show sessions that do not appear in other methods.
+      Section 5 flags a lingering user state when that happens without logon/processes.
 ```
 
 ## Understanding the Output
@@ -166,24 +169,27 @@ Shows processes running as the target user. Active sessions will have processes.
 Shows network file sharing connections. May be empty if no file shares are connected.
 
 ### Section 5: Lingering Session Analysis
-**This is the key section** - it identifies sessions that:
-- ✅ Appear in `NetWkstaUserEnum` (Section 1)
-- ❌ Do NOT have an active logon session (Section 2)
-- ❌ Do NOT have running processes (Section 3)
+**This is the key section.** It applies a **user-level** heuristic (not per duplicate NetWkstaUserEnum row):
 
-These are **lingering sessions** that may need cleanup.
+- The target user appears in `NetWkstaUserEnum` (Section 1), and
+- There is **no** matching WMI logon session (Section 2), and
+- There are **no** running processes for that identity (Section 3)
+
+→ then the script reports a **lingering user state** and lists all NetWkstaUserEnum rows for that user. SMB (Section 4) is informational only. If the user has any active logon or any process, the script reports **active user state** and still shows the NetWkstaUserEnum rows for comparison (BloodHound `HasSession` is driven by that API, not by WMI alone).
 
 ## What is a Lingering Session?
 
-A lingering session is a user session that appears in `NetWkstaUserEnum` but:
-- Has no corresponding active logon session
-- Has no running processes
-- May be a stale cached session or a session that didn't properly log off
+A **lingering user state** (as reported here) means the account appears in `NetWkstaUserEnum` but:
+- Has no corresponding active WMI logon session for that identity, and
+- Has no running processes under that identity
 
-These sessions can:
-- Consume system resources
-- Pose security risks if credentials are cached
-- Indicate improper session cleanup
+It may be a stale cached entry, a session that did not fully log off, or similar. `NetWkstaUserEnum` can also return **duplicate rows** for the same user; the script does not try to map each row to a distinct logon (that data is not in level 1).
+
+Such stale entries can consume resources, retain cached credentials, or indicate incomplete session cleanup.
+
+## BloodHound and timing
+
+SharpHound/BloodHound `HasSession` edges reflect **collection-time** data. A session can disappear between the last BloodHound run and when you run this script, or still be visible here after the graph was collected. Compare timestamps and collection scope when reconciling differences.
 
 ## Error Codes
 
@@ -197,8 +203,9 @@ If the script encounters errors, common return codes from `NetWkstaUserEnum`:
 
 - Machine accounts (ending with `$`) are filtered out when analyzing user sessions
 - The script handles multiple buffer reads automatically if there are many sessions
-- Administrator privileges are recommended for best results
-- Remote queries require appropriate network access and permissions
+- Administrator privileges are recommended for best results (required for `-IncludeUserName` on processes in many environments)
+- Remote queries need NetAPI access for Section 1 and WinRM/CIM (and remoting permissions) for Sections 2–3; use the same class of credentials you use for session collection where possible
+- Avoid smart quotes when editing the script in some editors; PowerShell can mis-parse strings that contain Unicode apostrophes inside host strings
 
 ## License
 

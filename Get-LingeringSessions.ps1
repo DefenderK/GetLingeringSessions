@@ -155,13 +155,126 @@ function Get-NetWkstaUserSessions {
     return $sessions
 }
 
+function Test-TargetServerIsLocal {
+    param([string]$ServerName)
+    $n = if ($ServerName) { $ServerName.Trim() } else { '' }
+    if ([string]::IsNullOrWhiteSpace($n)) { return $true }
+    if ($n -in @('.', 'localhost', '127.0.0.1')) { return $true }
+    if ($n -ieq $env:COMPUTERNAME) { return $true }
+    try {
+        $dnsShort = ([System.Net.Dns]::GetHostEntry('localhost').HostName -split '\.')[0]
+        if ($n -ieq $dnsShort) { return $true }
+    } catch { }
+    return $false
+}
+
+function Get-TargetUserIdentity {
+    param([string]$Raw)
+    $t = $Raw.Trim()
+    if ($t -match '^([^\\]+)\\(.+)$') {
+        return [PSCustomObject]@{
+            Domain    = $matches[1]
+            Sam       = $matches[2]
+            Canonical = "$($matches[1])\$($matches[2])"
+        }
+    }
+    if ($t -match '^([^@]+)@(.+)$') {
+        return [PSCustomObject]@{
+            Domain    = $matches[2]
+            Sam       = $matches[1]
+            Canonical = "$($matches[2])\$($matches[1])"
+        }
+    }
+    return [PSCustomObject]@{
+        Domain    = ''
+        Sam       = $t
+        Canonical = $t
+    }
+}
+
+function Test-IdentityMatch {
+    param(
+        [string]$Candidate,
+        [PSCustomObject]$Identity,
+        [string]$RawOriginal
+    )
+    if ([string]::IsNullOrWhiteSpace($Candidate)) { return $false }
+    if ($Candidate -ieq $RawOriginal.Trim()) { return $true }
+    if ($Identity.Canonical -and ($Candidate -ieq $Identity.Canonical)) { return $true }
+    if ($Identity.Sam -and ($Candidate -ieq $Identity.Sam)) { return $true }
+    if ($Identity.Sam) {
+        $suffix = "\$($Identity.Sam)"
+        if ($Candidate.EndsWith($suffix, [StringComparison]::OrdinalIgnoreCase)) { return $true }
+    }
+    return $false
+}
+
+function Get-LogonSessionsForTargetUser {
+    param(
+        [string]$ComputerName,
+        [bool]$IsLocal,
+        [PSCustomObject]$Identity,
+        [string]$RawTargetUser
+    )
+
+    $cimParams = @{ ClassName = 'Win32_LogonSession'; ErrorAction = 'SilentlyContinue' }
+    if (-not $IsLocal) { $cimParams['ComputerName'] = $ComputerName }
+
+    $allLogonSessions = Get-CimInstance @cimParams
+    if (-not $allLogonSessions) { return @() }
+
+    $out = [System.Collections.Generic.List[object]]::new()
+    foreach ($session in @($allLogonSessions)) {
+        $users = @()
+        try {
+            $users = @(Get-CimAssociatedInstance -InputObject $session -ResultClassName Win32_Account -ErrorAction SilentlyContinue)
+            if ($users.Count -eq 0) {
+                $users = @(Get-CimAssociatedInstance -InputObject $session -ResultClassName Win32_UserAccount -ErrorAction SilentlyContinue)
+            }
+        } catch { }
+        foreach ($user in $users) {
+            $fullName = "$($user.Domain)\$($user.Name)"
+            if (Test-IdentityMatch -Candidate $fullName -Identity $Identity -RawOriginal $RawTargetUser) {
+                $out.Add([PSCustomObject]@{
+                    LogonId       = $session.LogonId
+                    LogonType     = $session.LogonType
+                    LogonTypeName = switch ($session.LogonType) {
+                        2  { 'Interactive' }
+                        3  { 'Network' }
+                        4  { 'Batch' }
+                        5  { 'Service' }
+                        7  { 'Unlock' }
+                        8  { 'NetworkCleartext' }
+                        9  { 'NewCredentials' }
+                        10 { 'RemoteInteractive (RDP)' }
+                        11 { 'CachedInteractive' }
+                        default { "Unknown ($($session.LogonType))" }
+                    }
+                    StartTime     = $session.StartTime
+                    User          = $fullName
+                })
+            }
+        }
+    }
+    return $out
+}
+
+$script:IsLocalTarget = Test-TargetServerIsLocal -ServerName $TargetServer
+$script:TargetUserIdentity = Get-TargetUserIdentity -Raw $TargetUser
+
 # Main execution
 Write-Host "`n" -NoNewline
 Write-Host "================================================================================" -ForegroundColor Cyan
 Write-Host "LINGERING SESSION DETECTION REPORT" -ForegroundColor Cyan
 Write-Host "================================================================================" -ForegroundColor Cyan
 Write-Host "Target Server: $TargetServer" -ForegroundColor Yellow
-Write-Host "Target User: $TargetUser`n" -ForegroundColor Yellow
+Write-Host "Target User: $TargetUser" -ForegroundColor Yellow
+if (-not $script:IsLocalTarget) {
+    Write-Host "Query mode: Remote (Sections 2-4 use WinRM/CIM to $TargetServer where applicable)" -ForegroundColor DarkYellow
+} else {
+    Write-Host "Query mode: Local" -ForegroundColor DarkYellow
+}
+Write-Host ""
 
 # Collect all data first
 $wkstaSessions = @()
@@ -193,9 +306,10 @@ try {
         Write-Host "`nALL SESSIONS (including machine accounts):" -ForegroundColor Yellow
         $wkstaSessions | Format-Table -AutoSize
         
-        # Filter for target user (excluding machine accounts)
-        $targetSessions = $wkstaSessions | Where-Object { 
-            $_.FullName -eq $TargetUser -and -not $_.Username.EndsWith('$')
+        # Filter for target user (excluding machine accounts); match DOMAIN\User, UPN, or SAM-only
+        $targetSessions = $wkstaSessions | Where-Object {
+            -not $_.Username.EndsWith('$') -and
+            (Test-IdentityMatch -Candidate $_.FullName -Identity $script:TargetUserIdentity -RawOriginal $TargetUser)
         }
         if ($targetSessions) {
             Write-Host "`nSessions matching '$TargetUser' (excluding machine accounts):" -ForegroundColor Green
@@ -222,38 +336,9 @@ Write-Host "                 2 = Interactive, 3 = Network, 10 = RemoteInteractiv
 Write-Host ""
 
 try {
-    $allLogonSessions = Get-WmiObject Win32_LogonSession -ErrorAction SilentlyContinue
-    
-    $logonSessions = $allLogonSessions |
-        ForEach-Object {
-            $session = $_
-            $users = $session.GetRelated('Win32_Account')
-            foreach ($user in $users) {
-                $fullName = "$($user.Domain)\$($user.Name)"
-                if ($fullName -eq $TargetUser) {
-                    [PSCustomObject]@{
-                        LogonId       = $session.LogonId
-                        LogonType     = $session.LogonType
-                        LogonTypeName = switch ($session.LogonType) {
-                            2  { "Interactive" }
-                            3  { "Network" }
-                            4  { "Batch" }
-                            5  { "Service" }
-                            7  { "Unlock" }
-                            8  { "NetworkCleartext" }
-                            9  { "NewCredentials" }
-                            10 { "RemoteInteractive (RDP)" }
-                            11 { "CachedInteractive" }
-                            default { "Unknown ($($session.LogonType))" }
-                        }
-                        StartTime     = $session.StartTime
-                        User          = $fullName
-                    }
-                }
-            }
-        }
-    
-    if ($logonSessions) {
+    $logonSessions = @(Get-LogonSessionsForTargetUser -ComputerName $TargetServer -IsLocal $script:IsLocalTarget -Identity $script:TargetUserIdentity -RawTargetUser $TargetUser)
+
+    if ($logonSessions.Count -gt 0) {
         Write-Host "Active logon sessions found: $($logonSessions.Count)" -ForegroundColor Green
         $logonSessions | Format-Table -AutoSize
     } else {
@@ -276,10 +361,36 @@ Write-Host "                 security context. Active sessions will have process
 Write-Host ""
 
 try {
-    $processes = Get-Process -IncludeUserName -ErrorAction SilentlyContinue |
-        Where-Object { $_.UserName -eq $TargetUser }
-    
-    if ($processes) {
+    if ($script:IsLocalTarget) {
+        $processes = @(Get-Process -IncludeUserName -ErrorAction SilentlyContinue |
+            Where-Object { Test-IdentityMatch -Candidate $_.UserName -Identity $script:TargetUserIdentity -RawOriginal $TargetUser })
+    } else {
+        $canon = $script:TargetUserIdentity.Canonical
+        $sam = $script:TargetUserIdentity.Sam
+        $raw = $TargetUser
+        try {
+            $processes = @(Invoke-Command -ComputerName $TargetServer -ScriptBlock {
+                param($Canon, $Sam, $RawOrig)
+                Get-Process -IncludeUserName -ErrorAction SilentlyContinue | Where-Object {
+                    if (-not $_.UserName) { return $false }
+                    $u = $_.UserName
+                    if ($u -ieq $RawOrig) { return $true }
+                    if ($Canon -and ($u -ieq $Canon)) { return $true }
+                    if ($Sam -and ($u -ieq $Sam)) { return $true }
+                    if ($Sam) {
+                        $i = $u.LastIndexOf('\')
+                        if ($i -ge 0 -and ($u.Substring($i + 1) -ieq $Sam)) { return $true }
+                    }
+                    return $false
+                }
+            } -ArgumentList $canon, $sam, $raw -ErrorAction Stop)
+        } catch {
+            Write-Warning "Remote process enumeration failed (requires WinRM and appropriate rights on ${TargetServer}): $_"
+            $processes = @()
+        }
+    }
+
+    if ($processes.Count -gt 0) {
         Write-Host "Active processes found: $($processes.Count)" -ForegroundColor Green
         $processes | Select-Object Name, Id, UserName | Format-Table -AutoSize
     } else {
@@ -302,10 +413,24 @@ Write-Host "                 These represent network file share connections." -F
 Write-Host ""
 
 try {
-    $smbSessions = Get-SmbSession -ErrorAction SilentlyContinue |
-        Where-Object { $_.ClientUserName -eq $TargetUser }
-    
-    if ($smbSessions) {
+    if ($script:IsLocalTarget) {
+        $smbSessions = @(Get-SmbSession -ErrorAction SilentlyContinue |
+            Where-Object { Test-IdentityMatch -Candidate $_.ClientUserName -Identity $script:TargetUserIdentity -RawOriginal $TargetUser })
+    } else {
+        $cimSmb = $null
+        $smbSessions = @()
+        try {
+            $cimSmb = New-CimSession -ComputerName $TargetServer -ErrorAction Stop
+            $smbSessions = @(Get-SmbSession -CimSession $cimSmb -ErrorAction SilentlyContinue |
+                Where-Object { Test-IdentityMatch -Candidate $_.ClientUserName -Identity $script:TargetUserIdentity -RawOriginal $TargetUser })
+        } catch {
+            Write-Warning "SMB session query skipped or failed for remote target (requires WinRM/CIM and SMB management on $TargetServer ): $_"
+        } finally {
+            if ($cimSmb) { Remove-CimSession -CimSession $cimSmb -ErrorAction SilentlyContinue }
+        }
+    }
+
+    if ($smbSessions.Count -gt 0) {
         Write-Host "SMB sessions found: $($smbSessions.Count)" -ForegroundColor Green
         $smbSessions | Select-Object ClientUserName, ClientComputerName, NumOpens | Format-Table -AutoSize
     } else {
@@ -322,64 +447,45 @@ Write-Host "`n" -NoNewline
 Write-Host "================================================================================" -ForegroundColor Red
 Write-Host "SECTION 5: LINGERING SESSION ANALYSIS" -ForegroundColor Red
 Write-Host "================================================================================" -ForegroundColor Red
-Write-Host "WHAT THIS SHOWS: Sessions that appear in NetWkstaUserEnum but are NOT" -ForegroundColor White
-Write-Host "                 found in active logon sessions or processes." -ForegroundColor White
-Write-Host "                 These are LINGERING sessions that may need cleanup." -ForegroundColor White
+Write-Host "WHAT THIS SHOWS: User-level check - if the target user appears in NetWkstaUserEnum" -ForegroundColor White
+Write-Host "                 (Section 1) but has no matching WMI logon sessions (Section 2)" -ForegroundColor White
+Write-Host "                 and no running processes (Section 3), we flag a LINGERING state." -ForegroundColor White
+Write-Host "                 NetWkstaUserEnum can return duplicate rows; SMB (Section 4) is informational." -ForegroundColor White
 Write-Host ""
 
-# Get target user sessions from NetWkstaUserEnum (excluding machine accounts)
-$targetWkstaSessions = $wkstaSessions | Where-Object { 
-    $_.FullName -eq $TargetUser -and -not $_.Username.EndsWith('$')
-}
+# All NetWkstaUserEnum rows for this user (excluding machine accounts)
+$targetWkstaSessions = @($wkstaSessions | Where-Object {
+    -not $_.Username.EndsWith('$') -and
+    (Test-IdentityMatch -Candidate $_.FullName -Identity $script:TargetUserIdentity -RawOriginal $TargetUser)
+})
 
-if ($targetWkstaSessions) {
-    $lingeringSessions = @()
-    
-    foreach ($wkstaSession in $targetWkstaSessions) {
-        # Check if this session appears in active logon sessions
-        $hasActiveLogon = $logonSessions.Count -gt 0
-        $hasProcesses = $processes.Count -gt 0
-        $hasSmbSession = $smbSessions.Count -gt 0
-        
-        # A session is "lingering" if it's in NetWkstaUserEnum but has no active logon or processes
-        if (-not $hasActiveLogon -and -not $hasProcesses) {
-            $lingeringSessions += [PSCustomObject]@{
-                Username      = $wkstaSession.Username
-                LogonDomain   = $wkstaSession.LogonDomain
-                LogonServer   = $wkstaSession.LogonServer
-                FullName      = $wkstaSession.FullName
-                Status        = "LINGERING - No active logon or processes"
-                HasActiveLogon = $hasActiveLogon
-                HasProcesses   = $hasProcesses
-                HasSmbSession  = $hasSmbSession
-            }
-        } else {
-            # Show active sessions for comparison
-            Write-Host "ACTIVE SESSION DETECTED:" -ForegroundColor Green
-            Write-Host "  User: $($wkstaSession.FullName)" -ForegroundColor Green
-            Write-Host "  Logon Server: $($wkstaSession.LogonServer)" -ForegroundColor Green
-            Write-Host "  Has Active Logon Session: $hasActiveLogon" -ForegroundColor Green
-            Write-Host "  Has Running Processes: $hasProcesses ($($processes.Count) processes)" -ForegroundColor Green
-            Write-Host "  Has SMB Session: $hasSmbSession" -ForegroundColor Green
-            Write-Host "  Status: ACTIVE (Not lingering)" -ForegroundColor Green
-            Write-Host ""
-        }
-    }
-    
-    if ($lingeringSessions.Count -gt 0) {
-        Write-Host "*** LINGERING SESSIONS FOUND ***" -ForegroundColor Red
-        Write-Host "The following sessions appear in NetWkstaUserEnum but have NO active" -ForegroundColor Red
-        Write-Host "logon sessions or running processes. These may need to be cleaned up:" -ForegroundColor Red
+if ($targetWkstaSessions.Count -gt 0) {
+    $hasActiveLogon = $logonSessions.Count -gt 0
+    $hasProcesses = $processes.Count -gt 0
+    $hasSmbSession = $smbSessions.Count -gt 0
+
+    if (-not $hasActiveLogon -and -not $hasProcesses) {
+        Write-Host "*** LINGERING USER STATE (NetWkstaUserEnum vs logon/processes) ***" -ForegroundColor Red
+        Write-Host "The user appears in NetWkstaUserEnum but has no active WMI logon sessions and no" -ForegroundColor Red
+        Write-Host "running processes on $TargetServer for this identity. NetWkstaUserEnum row(s):" -ForegroundColor Red
         Write-Host ""
-        $lingeringSessions | Format-Table -AutoSize
+        $targetWkstaSessions | Format-Table -AutoSize
         Write-Host ""
-        Write-Host "RECOMMENDATION: Investigate these sessions. They may be:" -ForegroundColor Yellow
+        Write-Host "Context: Has SMB session (informational): $hasSmbSession" -ForegroundColor Yellow
+        Write-Host ""
+        Write-Host "RECOMMENDATION: Investigate stale/cached NetWkstaUserEnum entries. They may be:" -ForegroundColor Yellow
         Write-Host "  - Stale cached sessions" -ForegroundColor Yellow
-        Write-Host "  - Sessions that didn't properly log off" -ForegroundColor Yellow
+        Write-Host "  - Sessions that did not properly log off" -ForegroundColor Yellow
         Write-Host "  - Network logon sessions that are no longer active" -ForegroundColor Yellow
     } else {
-        Write-Host "No lingering sessions detected." -ForegroundColor Green
-        Write-Host "All sessions found in NetWkstaUserEnum have corresponding active logons or processes." -ForegroundColor Green
+        Write-Host "ACTIVE USER STATE (not lingering by this heuristic):" -ForegroundColor Green
+        Write-Host "  NetWkstaUserEnum row count for user: $($targetWkstaSessions.Count)" -ForegroundColor Green
+        Write-Host "  Has WMI logon session: $hasActiveLogon ($($logonSessions.Count) session(s))" -ForegroundColor Green
+        Write-Host "  Has running processes: $hasProcesses ($($processes.Count) process(es))" -ForegroundColor Green
+        Write-Host "  Has SMB session (informational): $hasSmbSession" -ForegroundColor Green
+        Write-Host ""
+        Write-Host "NetWkstaUserEnum detail:" -ForegroundColor Green
+        $targetWkstaSessions | Format-Table -AutoSize
     }
 } else {
     Write-Host "No sessions found for '$TargetUser' in NetWkstaUserEnum." -ForegroundColor Yellow
@@ -398,6 +504,6 @@ Write-Host "Active Logon Sessions: $($logonSessions.Count)" -ForegroundColor Whi
 Write-Host "Running Processes: $($processes.Count)" -ForegroundColor White
 Write-Host "SMB Sessions: $($smbSessions.Count)" -ForegroundColor White
 Write-Host ""
-Write-Host "Note: NetWkstaUserEnum may show sessions that don't appear in other methods." -ForegroundColor Yellow
-Write-Host "      These are the 'lingering' sessions that Section 5 identifies." -ForegroundColor Yellow
+Write-Host "Note: NetWkstaUserEnum may show sessions that do not appear in other methods." -ForegroundColor Yellow
+Write-Host "      Section 5 flags a lingering user state when that happens without logon/processes." -ForegroundColor Yellow
 
