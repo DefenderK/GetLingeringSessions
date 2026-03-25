@@ -281,6 +281,8 @@ $wkstaSessions = @()
 $logonSessions = @()
 $processes = @()
 $smbSessions = @()
+$script:LogonQueryFailed = $false
+$script:ProcessQueryFailed = $false
 
 # ============================================================================
 # SECTION 1: NetWkstaUserEnum - ALL SESSIONS (Complete Enumeration)
@@ -346,6 +348,7 @@ try {
         Write-Host "(This could indicate a lingering session if found in Section 1)" -ForegroundColor Red
     }
 } catch {
+    $script:LogonQueryFailed = $true
     Write-Warning "Error getting logon sessions: $_"
 }
 
@@ -385,6 +388,7 @@ try {
                 }
             } -ArgumentList $canon, $sam, $raw -ErrorAction Stop)
         } catch {
+            $script:ProcessQueryFailed = $true
             Write-Warning "Remote process enumeration failed (requires WinRM and appropriate rights on ${TargetServer}): $_"
             $processes = @()
         }
@@ -398,6 +402,7 @@ try {
         Write-Host "(This could indicate a lingering session if found in Section 1)" -ForegroundColor Red
     }
 } catch {
+    $script:ProcessQueryFailed = $true
     Write-Warning "Error getting processes: $_"
 }
 
@@ -471,6 +476,12 @@ if ($targetWkstaSessions.Count -gt 0) {
         Write-Host ""
         $targetWkstaSessions | Format-Table -AutoSize
         Write-Host ""
+        if ($script:ProcessQueryFailed -or $script:LogonQueryFailed) {
+            Write-Host "IMPORTANT: Section 2 and/or Section 3 did not complete successfully (see warnings above)." -ForegroundColor Yellow
+            Write-Host "         Re-run in an elevated PowerShell (Run as Administrator) or fix remote access" -ForegroundColor Yellow
+            Write-Host "         before treating this as confirmed lingering." -ForegroundColor Yellow
+            Write-Host ""
+        }
         Write-Host "Context: Has SMB session (informational): $hasSmbSession" -ForegroundColor Yellow
         Write-Host ""
         Write-Host "RECOMMENDATION: Investigate stale/cached NetWkstaUserEnum entries. They may be:" -ForegroundColor Yellow

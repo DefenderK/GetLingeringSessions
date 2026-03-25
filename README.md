@@ -203,7 +203,7 @@ If the script encounters errors, common return codes from `NetWkstaUserEnum`:
 
 - Machine accounts (ending with `$`) are filtered out when analyzing user sessions
 - The script handles multiple buffer reads automatically if there are many sessions
-- Administrator privileges are recommended for best results (required for `-IncludeUserName` on processes in many environments)
+- **Run as Administrator** for reliable results: Section 3 needs elevation to list process owners; without it, Section 5 may show LINGERING with a warning that checks were incomplete—always read Section 1 for NetWkstaUserEnum facts regardless
 - Remote queries need NetAPI access for Section 1 and WinRM/CIM (and remoting permissions) for Sections 2–3; use the same class of credentials you use for session collection where possible
 - Avoid smart quotes when editing the script in some editors; PowerShell can mis-parse strings that contain Unicode apostrophes inside host strings
 
